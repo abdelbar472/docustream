@@ -1,0 +1,103 @@
+services:
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    ports:
+      - "9092:9092"   # host access (localhost:9092)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      # containers use kafka:19092, your host uses localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # topics are created explicitly below so partition counts are under our control
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        for t in documents.uploaded chunks.created documents.dlq; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 \
+            --create --if-not-exists --topic $$t --partitions 3 --replication-factor 1
+        done
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  api:
+    build: .
+    command: uvicorn app.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment: &app-env
+      KAFKA_BOOTSTRAP: kafka:19092
+      QDRANT_URL: http://qdrant:6333
+      SQLITE_PATH: /data/rag.db
+      EMBEDDER: ${EMBEDDER:-hash}
+    volumes:
+      - ./data:/data
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_started
+
+  # Scale these to watch consumer groups split the 3 partitions:
+  #   docker compose up -d --scale chunker=3
+  chunker:
+    build: .
+    command: python -m app.chunker_worker
+    environment: *app-env
+    volumes:
+      - ./data:/data
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  indexer:
+    build: .
+    command: python -m app.indexer_worker
+    environment: *app-env
+    volumes:
+      - ./data:/data
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_started
+
+volumes:
+  qdrant_data:

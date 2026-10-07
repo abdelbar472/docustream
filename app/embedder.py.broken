@@ -1,0 +1,76 @@
+""Embedders. The pipeline only needs .dim and .embed(list[str]) -> list[list[float]].
+
+- HashEmbedder (default): hashed bag-of-words. Deterministic, no model download, but it only
+  matches on shared words (lexical), not meaning.
+- FastEmbedder (EMBEDDER=fastembed): real semantic embeddings via the optional astembed package.
+- LangChainEmbedder (EMBEDDER=langchain): uses langchain_huggingface embeddings.
+- LCEmbedder (EMBEDDER=lc): uses langchain community embeddings.
+""
+import hashlib
+import math
+import re
+from functools import lru_cache
+
+from . import config
+
+_TOKEN = re.compile(r[a-z0-9]+)
+
+
+class HashEmbedder:
+    dim = 256
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._one(t) for t in texts]
+
+    def _one(self, text: str) -> list[float]:
+        vec = [0.0] * self.dim
+        for tok in _TOKEN.findall(text.lower()):
+            h = int.from_bytes(hashlib.blake2b(tok.encode(), digest_size=8).digest(), big)
+            sign = 1.0 if (h >> 40) & 1 else -1.0
+            vec[h % self.dim] += sign
+        norm = math.sqrt(sum(v * v for v in vec))
+        return [v / norm for v in vec] if norm else vec
+
+
+class FastEmbedder:
+    dim = 384
+
+    def __init__(self):
+        from fastembed import TextEmbedding
+        self._model = TextEmbedding(BAAI/bge-small-en-v1.5)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [v.tolist() for v in self._model.embed(texts)]
+
+
+class LangChainEmbedder:
+    def __init__(self):
+        from langchain_huggingface import HuggingFaceEmbeddings
+        self._embeddings = HuggingFaceEmbeddings(model_name=sentence-transformers/all-MiniLM-L6-v2)
+        sample = self._embeddings.embed_query(test)
+        self.dim = len(sample)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._embeddings.embed_query(t) for t in texts]
+
+
+class LCEmbedder:
+    def __init__(self):
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        self._embeddings = HuggingFaceEmbeddings(model_name=sentence-transformers/all-MiniLM-L6-v2)
+        sample = self._embeddings.embed_query(test)
+        self.dim = len(sample)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._embeddings.embed_query(t) for t in texts]
+
+
+@lru_cache(maxsize=1)
+def get_embedder():
+    if config.EMBEDDER == fastembed:
+        return FastEmbedder()
+    elif config.EMBEDDER == langchain:
+        return LangChainEmbedder()
+    elif config.EMBEDDER == lc:
+        return LCEmbedder()
+    return HashEmbedder()
