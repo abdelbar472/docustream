@@ -141,3 +141,7 @@ existing setup, delete the Qdrant volume (`docker compose down -v`) because the 
 - Search returns the closest chunks; it does not call an LLM to write an answer yet.
 - SQLite is shared by the API and workers through a volume, which is fine for a demo; use Postgres for anything real.
 - Single Kafka broker, replication factor 1.
+
+## LangChain Integration
+
+LangChain has been added for better text processing and embeddings. Features include alternative chunking strategies via split_text_langchain(), and LangChain-based embeddings with EMBEDDER=langchain or EMBEDDER=lc. See pp/langchain_utils.py for helpers.
