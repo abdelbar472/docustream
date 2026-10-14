@@ -66,7 +66,8 @@ services:
       KAFKA_BOOTSTRAP: kafka:19092
       QDRANT_URL: http://qdrant:6333
       SQLITE_PATH: /data/rag.db
-      EMBEDDER: ${EMBEDDER:-hash}
+      EMBEDDER: ${EMBEDDER:-fastembed}
+      FASTEMBED_CACHE_PATH: /data/fastembed
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
     volumes:
       - ./data:/data

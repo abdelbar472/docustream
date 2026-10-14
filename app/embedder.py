@@ -2,20 +2,29 @@
 
 - HashEmbedder (default): hashed bag-of-words. Deterministic, no model download, but it only
   matches on shared words (lexical), not meaning.
-- FastEmbedder (EMBEDDER=fastembed): real semantic embeddings via the optional astembed package.
+- FastEmbedder (EMBEDDER=fastembed): real semantic embeddings via the optional fastembed package.
 - LCEmbeddings (EMBEDDER=langchain or lc): LangChain-based embeddings.
 """
 import hashlib
+import logging
 import math
 import re
 from functools import lru_cache
 
 from . import config
 
+log = logging.getLogger("embedder")
+
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 
+def tokenize(text: str) -> list[str]:
+    """Same tokenization the embedder uses, exposed so search can highlight matches."""
+    return _TOKEN.findall(text.lower())
+
+
 class HashEmbedder:
+    name = "hash"
     dim = 256
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -32,6 +41,7 @@ class HashEmbedder:
 
 
 class FastEmbedder:
+    name = "fastembed"
     dim = 384
 
     def __init__(self):
@@ -45,6 +55,9 @@ class FastEmbedder:
 
 class LCEmbeddings:
     """LangChain embeddings wrapper."""
+
+    name = "langchain"
+
     def __init__(self):
         try:
             from langchain_huggingface import HuggingFaceEmbeddings
@@ -85,7 +98,15 @@ LangChainEmbedder = LCEmbeddings
 @lru_cache(maxsize=1)
 def get_embedder():
     if config.EMBEDDER == "fastembed":
-        return FastEmbedder()
+        try:
+            return FastEmbedder()
+        except Exception as e:  # offline, missing model, no fastembed install...
+            log.warning("fastembed unavailable (%s); falling back to HashEmbedder", e)
+            return HashEmbedder()
     elif config.EMBEDDER in ("langchain", "lc", "langchain-huggingface"):
-        return LCEmbeddings()
+        try:
+            return LCEmbeddings()
+        except Exception as e:
+            log.warning("langchain embeddings unavailable (%s); falling back to HashEmbedder", e)
+            return HashEmbedder()
     return HashEmbedder()

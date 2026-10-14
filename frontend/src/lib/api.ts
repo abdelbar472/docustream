@@ -17,10 +17,29 @@ export interface Document {
 
 export interface SearchResult {
   score: number;
+  match: number;
   doc_id: string;
   filename: string;
   chunk_index: number;
   text: string;
+  snippet: string;
+}
+
+export interface Facet {
+  filename: string;
+  count: number;
+}
+
+export interface SearchResponse {
+  query: string;
+  count: number;
+  total: number;
+  offset: number;
+  terms: string[];
+  corrected_terms: string[];
+  corrections: string[];
+  facets: Facet[];
+  results: SearchResult[];
 }
 
 export interface Health {
@@ -112,9 +131,14 @@ export function uploadText(title: string, text: string) {
   });
 }
 
-export async function search(q: string, limit = 5) {
-  const data = await request<{ query: string; count: number; results: SearchResult[] }>(
-    `/search?q=${encodeURIComponent(q)}&limit=${limit}`,
-  );
-  return data.results;
+export function search(
+  q: string,
+  limit = 5,
+  opts?: { docId?: string; filename?: string; offset?: number; signal?: AbortSignal },
+) {
+  const params = new URLSearchParams({ q, limit: String(limit) });
+  if (opts?.docId) params.set("doc_id", opts.docId);
+  if (opts?.filename) params.set("filename", opts.filename);
+  if (opts?.offset) params.set("offset", String(opts.offset));
+  return request<SearchResponse>(`/search?${params.toString()}`, { signal: opts?.signal });
 }

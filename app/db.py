@@ -78,6 +78,17 @@ def list_documents(status: str | None = None, limit: int = 50):
     return [dict(r) for r in rows]
 
 
+def delete_document(doc_id: str) -> bool:
+    """Remove a document and its chunk bookkeeping. Returns False if it didn't exist."""
+    with connect() as db:
+        row = db.execute("SELECT 1 FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if not row:
+            return False
+        db.execute("DELETE FROM indexed_chunks WHERE doc_id = ?", (doc_id,))
+        db.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    return True
+
+
 def stats() -> dict:
     with connect() as db:
         rows = db.execute("SELECT status, COUNT(*) AS n FROM documents GROUP BY status").fetchall()

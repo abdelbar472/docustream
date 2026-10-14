@@ -3,7 +3,15 @@ import logging
 import uuid
 
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 from . import config
 
@@ -21,8 +29,29 @@ def point_id(doc_id: str, chunk_index: int) -> str:
     return str(uuid.uuid5(_NAMESPACE, f"{doc_id}:{chunk_index}"))
 
 
-async def ensure_collection(client: AsyncQdrantClient, dim: int, attempts: int = 30, delay: float = 2.0):
-    """Create the collection if missing. Retries so services can start in any order."""
+async def delete_by_doc(client: AsyncQdrantClient, doc_id: str) -> None:
+    """Remove every chunk belonging to a document."""
+    await client.delete(
+        config.COLLECTION,
+        points_selector=FilterSelector(
+            filter=Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))])
+        ),
+    )
+
+
+async def ensure_collection(
+    client: AsyncQdrantClient,
+    dim: int,
+    embedder=None,
+    attempts: int = 30,
+    delay: float = 2.0,
+):
+    """Create the collection if missing. Retries so services can start in any order.
+
+    If the collection exists but was built with a different vector size (e.g. the
+    embedder changed), it is rebuilt. When ``embedder`` is supplied the stored
+    chunks are re-embedded so no data is lost.
+    """
     for attempt in range(1, attempts + 1):
         try:
             if not await client.collection_exists(config.COLLECTION):
@@ -30,6 +59,21 @@ async def ensure_collection(client: AsyncQdrantClient, dim: int, attempts: int =
                     config.COLLECTION,
                     vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
                 )
+                return
+            existing = _vector_size(await client.get_collection(config.COLLECTION))
+            if existing is not None and existing != dim:
+                if embedder is None:
+                    # Only the API migrates; other services wait for the new dim.
+                    raise RuntimeError(
+                        f"collection dim {existing} != {dim}; waiting for migration"
+                    )
+                log.warning(
+                    "collection %s has dim %s but embedder needs %s; rebuilding",
+                    config.COLLECTION,
+                    existing,
+                    dim,
+                )
+                await _rebuild(client, dim, embedder)
             return
         except Exception as e:
             # another service may have created it between our check and create
@@ -42,6 +86,54 @@ async def ensure_collection(client: AsyncQdrantClient, dim: int, attempts: int =
                 raise
             log.warning("Qdrant not ready (%s), retry %d/%d", e, attempt, attempts)
             await asyncio.sleep(delay)
+
+
+def _vector_size(info) -> int | None:
+    vectors = getattr(getattr(info, "config", None), "params", None)
+    vectors = getattr(vectors, "vectors", None)
+    size = getattr(vectors, "size", None)
+    return size if isinstance(size, int) else None
+
+
+async def scroll_all(client: AsyncQdrantClient) -> list[dict]:
+    """Read every point's payload. Fine at demo scale; used to build lexical search."""
+    payloads: list[dict] = []
+    offset = None
+    while True:
+        points, offset = await client.scroll(
+            config.COLLECTION, limit=256, offset=offset, with_payload=True
+        )
+        payloads.extend(p.payload for p in points if p.payload)
+        if offset is None:
+            return payloads
+
+
+async def _rebuild(client: AsyncQdrantClient, dim: int, embedder) -> None:
+    payloads = await scroll_all(client)
+    await client.delete_collection(config.COLLECTION)
+    await client.create_collection(
+        config.COLLECTION,
+        vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+    )
+    if not payloads or embedder is None:
+        return
+    for start in range(0, len(payloads), 64):
+        batch = payloads[start : start + 64]
+        vectors = await asyncio.to_thread(embedder.embed, [p["text"] for p in batch])
+        await upsert_points(
+            client,
+            [
+                make_point(
+                    doc_id=p["doc_id"],
+                    chunk_index=p["chunk_index"],
+                    filename=p.get("filename", ""),
+                    text=p["text"],
+                    vector=v,
+                )
+                for p, v in zip(batch, vectors)
+            ],
+        )
+    log.info("re-embedded %d chunks into %s", len(payloads), config.COLLECTION)
 
 
 def make_point(*, doc_id: str, chunk_index: int, filename: str, text: str,
@@ -67,9 +159,26 @@ async def upsert_chunk(client: AsyncQdrantClient, *, doc_id: str, chunk_index: i
     )])
 
 
-async def search(client: AsyncQdrantClient, vector: list[float], limit: int = 5) -> list[dict]:
+async def search(
+    client: AsyncQdrantClient,
+    vector: list[float],
+    limit: int = 5,
+    doc_id: str | None = None,
+    filename: str | None = None,
+) -> list[dict]:
+    """Closest chunks by cosine similarity, optionally restricted to one document."""
+    conditions = []
+    if doc_id:
+        conditions.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id)))
+    if filename:
+        conditions.append(FieldCondition(key="filename", match=MatchValue(value=filename)))
+    query_filter = Filter(must=conditions) if conditions else None
     res = await client.query_points(
-        config.COLLECTION, query=vector, limit=limit, with_payload=True
+        config.COLLECTION,
+        query=vector,
+        limit=limit,
+        with_payload=True,
+        query_filter=query_filter,
     )
     return [
         {

@@ -87,6 +87,124 @@ def test_upload_end_to_end_then_search(client):
     assert hits[0]["filename"] == "bread.txt"
 
 
+def test_search_returns_snippets_terms_and_honors_doc_filter(client):
+    r1 = client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    r2 = client.post("/documents/text", json={"title": "bread.txt", "text": BREAD_DOC})
+    run_pipeline(client)
+
+    body = client.get("/search", params={"q": "consumers share partitions"}).json()
+    assert body["count"] >= 1
+    assert "consumers" in body["terms"]
+
+    top = body["results"][0]
+    assert top["filename"] == "kafka.md"
+    assert "snippet" in top
+    # the snippet is scoped to the query terms rather than the chunk's head
+    assert any(t in top["snippet"].lower() for t in body["terms"])
+
+    # doc_id filter only returns that document's chunks
+    bread_id = r2.json()["doc_id"]
+    filtered = client.get("/search", params={"q": "consumers", "doc_id": bread_id}).json()
+    assert filtered["results"]
+    assert all(h["doc_id"] == bread_id for h in filtered["results"])
+
+
+def test_search_deduplicates_identical_chunks(client):
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    run_pipeline(client)
+
+    results = client.get("/search", params={"q": "consumer groups partitions"}).json()["results"]
+    keys = [(r["filename"], r["chunk_index"]) for r in results]
+    assert len(keys) == len(set(keys))
+
+
+def test_search_ranks_lexical_matches_first(client):
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    client.post("/documents/text", json={"title": "bread.txt", "text": BREAD_DOC})
+    run_pipeline(client)
+
+    top = client.get("/search", params={"q": "sourdough baking oven"}).json()["results"][0]
+    assert top["filename"] == "bread.txt"
+    assert top["match"] == 1.0
+    assert top["score"] >= 0.5
+
+
+def test_search_limit_is_clamped(client):
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    run_pipeline(client)
+
+    assert client.get("/search", params={"q": "kafka", "limit": 0}).json()["count"] <= 1
+    assert client.get("/search", params={"q": "kafka", "limit": 999}).status_code == 200
+
+
+def test_search_stems_word_variants(client):
+    """Inflected forms of a query word still match the indexed text."""
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    client.post("/documents/text", json={"title": "bread.txt", "text": BREAD_DOC})
+    run_pipeline(client)
+
+    for q in ("consuming partitions", "share a partition", "consumers"):
+        top = client.get("/search", params={"q": q}).json()["results"][0]
+        assert top["filename"] == "kafka.md", q
+
+
+def test_search_tolerates_typos(client):
+    """A misspelled query word is auto-corrected against the corpus vocabulary."""
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    run_pipeline(client)
+
+    body = client.get("/search", params={"q": "kafka consummers"}).json()
+    assert body["results"][0]["filename"] == "kafka.md"
+    assert "consummers" in body["corrections"]
+
+
+def test_search_reports_facets_and_filters_by_filename(client):
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    client.post("/documents/text", json={"title": "bread.txt", "text": BREAD_DOC})
+    run_pipeline(client)
+
+    body = client.get("/search", params={"q": "the"}).json()
+    names = {f["filename"] for f in body["facets"]}
+    assert {"kafka.md", "bread.txt"} <= names
+
+    # selecting a filename narrows results but keeps the full facet list
+    only_bread = client.get("/search", params={"q": "the", "filename": "bread.txt"}).json()
+    assert only_bread["results"]
+    assert all(r["filename"] == "bread.txt" for r in only_bread["results"])
+    assert {"kafka.md", "bread.txt"} <= {f["filename"] for f in only_bread["facets"]}
+
+
+def test_search_paginates_with_offset(client, monkeypatch):
+    monkeypatch.setattr(config, "CHUNK_SIZE", 60)
+    monkeypatch.setattr(config, "CHUNK_OVERLAP", 10)
+    client.post("/documents/text", json={"title": "long.txt", "text": (KAFKA_DOC + " ") * 3})
+    run_pipeline(client)
+
+    page1 = client.get("/search", params={"q": "kafka", "limit": 2, "offset": 0}).json()
+    assert page1["total"] > 2
+    assert len(page1["results"]) == 2
+
+    page2 = client.get("/search", params={"q": "kafka", "limit": 2, "offset": 2}).json()
+    first = {(r["filename"], r["chunk_index"]) for r in page1["results"]}
+    second = {(r["filename"], r["chunk_index"]) for r in page2["results"]}
+    assert first.isdisjoint(second)
+
+
+def test_delete_document_removes_chunks_and_vectors(client):
+    r = client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    run_pipeline(client)
+    doc_id = r.json()["doc_id"]
+    assert asyncio.run(api.app.state.qdrant.count(config.COLLECTION)).count == 1
+
+    assert client.delete(f"/documents/{doc_id}").status_code == 200
+    assert client.get(f"/documents/{doc_id}").status_code == 404
+    assert asyncio.run(api.app.state.qdrant.count(config.COLLECTION)).count == 0
+    assert client.get("/documents").json()["count"] == 0
+
+    assert client.delete("/documents/nope").status_code == 404
+
+
 def test_stats_overview_reports_counts(client):
     client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
     run_pipeline(client)

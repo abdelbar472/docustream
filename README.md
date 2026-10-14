@@ -26,7 +26,7 @@ flowchart LR
 
 | Piece | Role |
 |---|---|
-| `app/api.py` | Upload endpoints, document status, search |
+| `app/api.py` | Upload endpoints, document status, search, delete |
 | `app/chunker_worker.py` | `documents.uploaded` → overlapping chunks → `chunks.created` |
 | `app/indexer_worker.py` | `chunks.created` → embedding → Qdrant, tracks progress |
 | `app/kafka_utils.py` | Shared consumer loop: manual commits, retries with backoff, DLQ |
@@ -69,7 +69,27 @@ Or by hand:
 curl -X POST http://localhost:8000/documents -F "file=@sample_docs/Portfolio/Backend/Qdrant.md"
 curl http://localhost:8000/documents                       # status: uploaded -> chunked -> indexed
 curl "http://localhost:8000/search?q=vector+search+database"
+curl -X DELETE http://localhost:8000/documents/<doc_id>    # removes the doc and its vectors
 ```
+
+Upload a whole folder with the demo script:
+
+```bash
+./demo.sh
+```
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/documents` | Upload a `.txt` / `.md` file (multipart `file`) |
+| `POST` | `/documents/text` | Ingest pasted text (`{"title", "text"}`) |
+| `GET` | `/documents` | List documents (`?status=`, `?limit=`) |
+| `GET` | `/documents/{doc_id}` | One document's status and chunk progress |
+| `DELETE` | `/documents/{doc_id}` | Delete a document, its chunks and its vectors |
+| `GET` | `/search` | Hybrid search (`?q=`, `?limit=`, `?offset=`, `?doc_id=`, `?filename=`) |
+| `GET` | `/stats` / `/stats/overview` | Counts by status / dashboard aggregates |
+| `GET` | `/health` | Liveness plus the active embedder |
 
 ## Things to try (these are the interesting parts)
 
@@ -108,21 +128,37 @@ pytest
 
 The tests run the whole pipeline logic without Kafka or Docker: a fake producer captures
 messages and they are fed into the next stage, with Qdrant in in-memory mode. They cover chunking,
-SQLite progress tracking, idempotent redelivery, validation errors, Kafka being down, and the retry wrapper.
+SQLite progress tracking, idempotent redelivery, validation errors, Kafka being down, the retry
+wrapper, and hybrid search (ranking, stemming, typo correction, snippets, dedupe, facets, pagination).
 
 ## Embeddings
 
-The default embedder is a hashed bag-of-words: deterministic and needs no model download, so
-the project runs offline, but it only matches on shared words, not meaning. For real semantic
-search, install `fastembed` and start with `EMBEDDER=fastembed`:
+The default embedder is `fastembed` (`BAAI/bge-small-en-v1.5`, 384-dim): real semantic
+embeddings, so the model is downloaded from Hugging Face on first start and cached
+(in Docker at `FASTEMBED_CACHE_PATH`, defaults to `/data/fastembed`). If the model can't be
+loaded (offline, blocked network), the app logs a warning and falls back to the hashed
+bag-of-words embedder, which is deterministic and needs no download but only matches on
+shared words. Force it explicitly with `EMBEDDER=hash`.
 
 ```bash
-pip install fastembed          # add it to requirements.txt for the Docker image
-EMBEDDER=fastembed docker compose up -d --build
+EMBEDDER=hash docker compose up -d --build   # lexical-only, fully offline
 ```
 
-The first start downloads the `BAAI/bge-small-en-v1.5` model. If you switch embedders on an
-existing setup, delete the Qdrant volume (`docker compose down -v`) because the vector size changes.
+Switching embedders changes the vector size. On startup the API detects the mismatch and
+re-embeds every stored chunk into a rebuilt collection (a couple of seconds at demo scale);
+the other workers wait until the new collection is ready.
+
+## Search
+
+Search is hybrid. Candidates come from both a vector search (meaning) and a cached BM25
+index over the whole corpus (exact words), then the two scores are blended
+(`SEARCH_LEXICAL_WEIGHT`, default `0.5`). The lexical side also
+
+- **stems** words, so "consumer", "consumers" and "consuming" all match;
+- **auto-corrects typos** against the corpus vocabulary (e.g. "consummers" → consumer);
+- returns **facets** per file and supports **offset/limit pagination**.
+
+The frontend exposes filename facet chips and a "Load more" button.
 
 ## Configuration
 
@@ -131,7 +167,10 @@ existing setup, delete the Qdrant volume (`docker compose down -v`) because the 
 | `KAFKA_BOOTSTRAP` | `localhost:9092` | Broker address (compose sets `kafka:19092`) |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant address |
 | `SQLITE_PATH` | `rag.db` | SQLite file (compose uses `./data/rag.db`) |
-| `EMBEDDER` | `hash` | `hash` or `fastembed` |
+| `EMBEDDER` | `fastembed` | `fastembed` (semantic, downloads a model) or `hash` (offline, lexical) |
+| `SEARCH_LEXICAL_WEIGHT` | `0.5` | Blend of BM25 lexical score vs vector similarity (0 = pure vector, 1 = pure BM25) |
+| `SEARCH_CANDIDATE_FACTOR` | `4` | Vector candidates fetched per requested result before re-ranking |
+| `FASTEMBED_CACHE_PATH` | `/data/fastembed` | Where the fastembed model is cached (compose sets this) |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `800` / `100` | Characters per chunk / overlap |
 | `MAX_ATTEMPTS` / `RETRY_BACKOFF` | `3` / `1.0` | Tries per message / first backoff in seconds |
 | `INDEXER_BATCH_SIZE` | `32` | Chunks embedded + upserted per batch |
@@ -151,4 +190,4 @@ existing setup, delete the Qdrant volume (`docker compose down -v`) because the 
 
 ## LangChain Integration
 
-LangChain has been added for better text processing and embeddings. Features include alternative chunking strategies via split_text_langchain(), and LangChain-based embeddings with EMBEDDER=langchain or EMBEDDER=lc. See pp/langchain_utils.py for helpers.
+LangChain has been added for better text processing and embeddings. Features include alternative chunking strategies via split_text_langchain(), and LangChain-based embeddings with EMBEDDER=langchain or EMBEDDER=lc. See app/langchain_utils.py for helpers.

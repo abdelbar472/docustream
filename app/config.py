@@ -11,8 +11,16 @@ SQLITE_PATH = os.getenv("SQLITE_PATH", "rag.db")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "chunks")
 
-# "hash" (default, no downloads, lexical) or "fastembed" (semantic, downloads a model)
-EMBEDDER = os.getenv("EMBEDDER", "hash")
+# "fastembed" (default: semantic, downloads a small model on first use) or
+# "hash" (no downloads, lexical bag-of-words). If fastembed can't load (no
+# network/model), the app falls back to the hash embedder automatically.
+EMBEDDER = os.getenv("EMBEDDER", "fastembed")
+
+# Search scoring: blend cosine similarity (meaning) with BM25 lexical score
+# (exact words, stemmed + typo-tolerant). 0 = pure vector, 1 = pure BM25.
+SEARCH_LEXICAL_WEIGHT = float(os.getenv("SEARCH_LEXICAL_WEIGHT", "0.5"))
+# Retrieve this multiple of `limit` candidates from Qdrant before re-ranking.
+SEARCH_CANDIDATE_FACTOR = int(os.getenv("SEARCH_CANDIDATE_FACTOR", "4"))
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))        # characters
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))  # characters

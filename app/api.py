@@ -6,9 +6,10 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import config, db, vectorstore
+from . import config, db, search_service, vectorstore
 from .embedder import get_embedder
 from .kafka_utils import make_producer
+from .lexical import tokenize
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
@@ -18,7 +19,9 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(db.init_db)
     app.state.embedder = get_embedder()
     app.state.qdrant = vectorstore.make_client()
-    await vectorstore.ensure_collection(app.state.qdrant, app.state.embedder.dim)
+    await vectorstore.ensure_collection(
+        app.state.qdrant, app.state.embedder.dim, embedder=app.state.embedder
+    )
     app.state.producer = await make_producer("api")
     try:
         yield
@@ -61,7 +64,8 @@ async def _ingest(filename: str, text: str) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "bootstrap": config.BOOTSTRAP, "embedder": config.EMBEDDER}
+    embedder = getattr(app.state.embedder, "name", config.EMBEDDER)
+    return {"status": "ok", "bootstrap": config.BOOTSTRAP, "embedder": embedder}
 
 
 @app.post("/documents", status_code=202)
@@ -100,6 +104,17 @@ async def get_document(doc_id: str):
     return doc
 
 
+@app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Delete a document, its chunks and its indexed vectors."""
+    doc = await asyncio.to_thread(db.get_document, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    await vectorstore.delete_by_doc(app.state.qdrant, doc_id)
+    await asyncio.to_thread(db.delete_document, doc_id)
+    return {"doc_id": doc_id, "status": "deleted"}
+
+
 @app.get("/stats")
 async def stats():
     return await asyncio.to_thread(db.stats)
@@ -110,7 +125,7 @@ async def stats_overview():
     """Everything the dashboard needs in one call: document counts, chunk totals and
     the vector count straight from Qdrant."""
     data = await asyncio.to_thread(db.overview)
-    data["embedder"] = config.EMBEDDER
+    data["embedder"] = getattr(app.state.embedder, "name", config.EMBEDDER)
     data["embedder_dim"] = app.state.embedder.dim
     data["collection"] = config.COLLECTION
     try:
@@ -121,12 +136,32 @@ async def stats_overview():
 
 
 @app.get("/search")
-async def search(q: str, limit: int = 5):
-    """Embed the query and return the closest chunks from Qdrant."""
+async def search(
+    q: str,
+    limit: int = 5,
+    doc_id: str | None = None,
+    filename: str | None = None,
+    offset: int = 0,
+):
+    """Hybrid search across all chunks.
+
+    Candidates come from two places: a vector search for meaning and a cached
+    BM25 index over the whole corpus for exact words (stemmed, typo-tolerant).
+    The two are blended, deduped, then sliced for offset/limit pagination. The
+    response also reports per-file facets and the corrected query terms.
+    """
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query is empty")
-    vector = (await asyncio.to_thread(app.state.embedder.embed, [q]))[0]
-    if not any(vector):
+    if not tokenize(q):
         raise HTTPException(status_code=400, detail="Query has no searchable words")
-    results = await vectorstore.search(app.state.qdrant, vector, limit)
-    return {"query": q, "count": len(results), "results": results}
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+    return await search_service.search(
+        app.state.qdrant,
+        app.state.embedder,
+        q,
+        limit=limit,
+        doc_id=doc_id,
+        filename=filename,
+        offset=offset,
+    )
