@@ -12,7 +12,7 @@ from qdrant_client import AsyncQdrantClient
 from app import api, config, db, vectorstore
 from app.chunker_worker import handle_document
 from app.embedder import HashEmbedder
-from app.indexer_worker import handle_chunk
+from app.indexer_worker import handle_chunk, handle_chunks
 from app.kafka_utils import _with_retries
 
 
@@ -87,6 +87,21 @@ def test_upload_end_to_end_then_search(client):
     assert hits[0]["filename"] == "bread.txt"
 
 
+def test_stats_overview_reports_counts(client):
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    run_pipeline(client)
+
+    ov = client.get("/stats/overview").json()
+    assert ov["total_documents"] == 1
+    assert ov["documents"]["indexed"] == 1
+    assert ov["documents"]["failed"] == 0
+    assert ov["total_chunks"] == 1
+    assert ov["indexed_chunks"] == 1
+    assert ov["embedder"] == "hash"
+    assert ov["embedder_dim"] == 256
+    assert ov["vectors"] == 1
+
+
 def test_redelivery_is_idempotent(client):
     client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
     run_pipeline(client)
@@ -137,6 +152,29 @@ def test_kafka_down_returns_503_and_marks_document_failed(client):
     assert r.status_code == 503
     failed = client.get("/documents", params={"status": "failed"}).json()["documents"]
     assert len(failed) == 1 and "publish failed" in failed[0]["error"]
+
+
+def test_indexer_batch_matches_single_path(client):
+    """The batch embedding/upsert path indexes the same chunks, idempotently."""
+    client.post("/documents/text", json={"title": "kafka.md", "text": KAFKA_DOC})
+    client.post("/documents/text", json={"title": "bread.txt", "text": BREAD_DOC})
+
+    producer = api.app.state.producer
+    embedder, qdrant = api.app.state.embedder, api.app.state.qdrant
+    chunker_out = FakeProducer()
+    for payload in [v for t, v, _ in producer.sent if t == config.TOPIC_DOCS]:
+        asyncio.run(handle_document(payload, chunker_out))
+
+    payloads = [v for t, v, _ in chunker_out.sent]
+    assert payloads
+    asyncio.run(handle_chunks(payloads, qdrant, embedder))
+    asyncio.run(handle_chunks(payloads, qdrant, embedder))  # redelivery
+
+    docs = client.get("/documents").json()["documents"]
+    assert all(d["status"] == "indexed" for d in docs)
+    assert all(d["indexed_chunks"] == d["total_chunks"] >= 1 for d in docs)
+    stored = asyncio.run(qdrant.count(config.COLLECTION)).count
+    assert stored == sum(d["total_chunks"] for d in docs)
 
 
 def test_chunker_rejects_text_without_words():

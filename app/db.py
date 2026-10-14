@@ -84,6 +84,25 @@ def stats() -> dict:
     return {r["status"]: r["n"] for r in rows}
 
 
+def overview() -> dict:
+    """Aggregate counters for the dashboard: documents by status plus chunk totals."""
+    with connect() as db:
+        rows = db.execute("SELECT status, COUNT(*) AS n FROM documents GROUP BY status").fetchall()
+        counts = {s: 0 for s in ("uploaded", "chunked", "indexed", "failed")}
+        for r in rows:
+            counts[r["status"]] = r["n"]
+        total_chunks = db.execute(
+            "SELECT COALESCE(SUM(total_chunks), 0) FROM documents"
+        ).fetchone()[0]
+        indexed_chunks = db.execute("SELECT COUNT(*) FROM indexed_chunks").fetchone()[0]
+    return {
+        "documents": counts,
+        "total_documents": sum(counts.values()),
+        "total_chunks": total_chunks,
+        "indexed_chunks": indexed_chunks,
+    }
+
+
 def set_chunked(doc_id: str, total_chunks: int):
     """Called by the chunker BEFORE it publishes chunks, so the indexer can always
     compare indexed vs total. A re-delivered message never moves 'indexed' backwards."""

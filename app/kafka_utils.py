@@ -42,6 +42,9 @@ async def make_producer(name: str) -> AIOKafkaProducer:
             bootstrap_servers=config.BOOTSTRAP,
             value_serializer=lambda v: json.dumps(v).encode(),
             acks="all",
+            # batch a few ms of records into one request and compress them
+            linger_ms=config.PRODUCER_LINGER_MS,
+            compression_type=config.PRODUCER_COMPRESSION or None,
         ),
         name,
     )
@@ -68,10 +71,19 @@ async def run_worker(
     topic: str,
     group: str,
     producer: AIOKafkaProducer,
-    handler: Callable[[dict], Awaitable[None]],
+    handler: Callable[[dict], Awaitable[None]] | None = None,
     on_dead: Callable[[dict | None, Exception], Awaitable[None]] | None = None,
+    batch_handler: Callable[[list[dict]], Awaitable[None]] | None = None,
+    max_batch: int = 1,
+    batch_wait_ms: int = 100,
 ):
-    """Consume `topic` in consumer group `group`, calling `handler(payload)` per message."""
+    """Consume `topic` in consumer group `group`.
+
+    With `batch_handler`, messages are pulled in batches (up to `max_batch`, waiting at
+    most `batch_wait_ms`) and handed over together so a stage can vectorize work such as
+    embedding and upserts. A batch that fails falls back to per-message retries and the
+    dead-letter path, so delivery semantics are identical to the single-message mode.
+    """
     consumer = await start_with_retry(
         lambda: AIOKafkaConsumer(
             topic,
@@ -83,22 +95,78 @@ async def run_worker(
         name,
     )
     log.info("%s: consuming %s as group %s", name, topic, group)
+    use_batch = batch_handler is not None and max_batch > 1
     try:
-        async for msg in consumer:
-            payload = None
-            try:
-                payload = json.loads(msg.value)
-                await _with_retries(name, handler, payload)
-            except Exception as e:
-                log.error("%s: giving up on %s[%d]@%d: %s", name, msg.topic, msg.partition, msg.offset, e)
-                await send_to_dlq(producer, msg, name, e)
-                if on_dead:
-                    await on_dead(payload, e)
-            # commit only after the message was handled or dead-lettered
-            await consumer.commit({TopicPartition(msg.topic, msg.partition): msg.offset + 1})
+        if use_batch:
+            await _batch_loop(consumer, producer, name, batch_handler, handler, on_dead,
+                              max_batch, batch_wait_ms)
+        else:
+            await _single_loop(consumer, producer, name, handler, on_dead)
     finally:
         await consumer.stop()
         await producer.stop()
+
+
+async def _commit(consumer, messages) -> None:
+    """Commit each partition at the highest offset seen + 1, after it was handled."""
+    offsets: dict[TopicPartition, int] = {}
+    for msg in messages:
+        offsets[TopicPartition(msg.topic, msg.partition)] = msg.offset + 1
+    if offsets:
+        await consumer.commit(offsets)
+
+
+async def _single_loop(consumer, producer, name, handler, on_dead) -> None:
+    async for msg in consumer:
+        payload = None
+        try:
+            payload = json.loads(msg.value)
+            await _with_retries(name, handler, payload)
+        except Exception as e:
+            log.error("%s: giving up on %s[%d]@%d: %s", name, msg.topic, msg.partition, msg.offset, e)
+            await send_to_dlq(producer, msg, name, e)
+            if on_dead:
+                await on_dead(payload, e)
+        # commit only after the message was handled or dead-lettered
+        await _commit(consumer, [msg])
+
+
+async def _batch_loop(consumer, producer, name, batch_handler, handler, on_dead,
+                      max_batch: int, batch_wait_ms: int) -> None:
+    while True:
+        batches = await consumer.getmany(timeout_ms=batch_wait_ms, max_records=max_batch)
+        messages = [msg for records in batches.values() for msg in records]
+        if not messages:
+            continue
+
+        ready: list = []      # (msg, payload) pairs that parsed fine
+        for msg in messages:
+            try:
+                ready.append((msg, json.loads(msg.value)))
+            except Exception as e:
+                log.error("%s: bad message %s[%d]@%d: %s",
+                          name, msg.topic, msg.partition, msg.offset, e)
+                await send_to_dlq(producer, msg, name, e)
+
+        if ready:
+            try:
+                await batch_handler([payload for _, payload in ready])
+            except Exception as e:
+                # isolate the failure: retry each message, dead-lettering the poison one
+                log.warning("%s: batch of %d failed (%s); falling back to per-message",
+                            name, len(ready), e)
+                for msg, payload in ready:
+                    try:
+                        await _with_retries(name, handler, payload)
+                    except Exception as e2:
+                        log.error("%s: giving up on %s[%d]@%d: %s",
+                                  name, msg.topic, msg.partition, msg.offset, e2)
+                        await send_to_dlq(producer, msg, name, e2)
+                        if on_dead:
+                            await on_dead(payload, e2)
+
+        # commit once, at the highest offset seen per partition, after handling everything
+        await _commit(consumer, messages)
 
 
 async def _with_retries(name: str, handler, payload: dict):

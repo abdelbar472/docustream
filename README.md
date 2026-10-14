@@ -31,6 +31,7 @@ flowchart LR
 | `app/indexer_worker.py` | `chunks.created` → embedding → Qdrant, tracks progress |
 | `app/kafka_utils.py` | Shared consumer loop: manual commits, retries with backoff, DLQ |
 | `app/db.py` | SQLite document/progress state (shared volume) |
+| `frontend/` | Next.js UI: upload files/text, live document status, search, statistics |
 
 ## Kafka concepts it demonstrates
 
@@ -52,22 +53,22 @@ This starts Kafka (KRaft, no Zookeeper), creates the three topics with 3 partiti
 
 | URL | What |
 |---|---|
+| http://localhost:3000 | Web UI: upload documents, watch status, search |
 | http://localhost:8000/docs | Swagger UI for the API |
 | http://localhost:8080 | Kafka UI: topics, partitions, messages, consumer groups |
 | http://localhost:6333/dashboard | Qdrant dashboard |
 
 ## Try it
 
-```bash
-./demo.sh        # uploads sample_docs/, waits for indexing, runs two searches
-```
+Open http://localhost:3000 and upload a `.txt` / `.md` file (or paste text), then watch it move
+`uploaded → chunked → indexed` and search the results.
 
 Or by hand:
 
 ```bash
-curl -X POST http://localhost:8000/documents -F "file=@sample_docs/kafka-basics.md"
+curl -X POST http://localhost:8000/documents -F "file=@sample_docs/Portfolio/Backend/Qdrant.md"
 curl http://localhost:8000/documents                       # status: uploaded -> chunked -> indexed
-curl "http://localhost:8000/search?q=how do consumer groups share partitions"
+curl "http://localhost:8000/search?q=vector+search+database"
 ```
 
 ## Things to try (these are the interesting parts)
@@ -133,7 +134,13 @@ existing setup, delete the Qdrant volume (`docker compose down -v`) because the 
 | `EMBEDDER` | `hash` | `hash` or `fastembed` |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `800` / `100` | Characters per chunk / overlap |
 | `MAX_ATTEMPTS` / `RETRY_BACKOFF` | `3` / `1.0` | Tries per message / first backoff in seconds |
+| `INDEXER_BATCH_SIZE` | `32` | Chunks embedded + upserted per batch |
+| `INDEXER_BATCH_WAIT_MS` | `100` | Max time to wait for a full indexer batch |
+| `PRODUCER_LINGER_MS` | `5` | Producer linger before sending (batches records) |
+| `PRODUCER_COMPRESSION` | `gzip` | Producer compression codec (`none` to disable) |
 | `MAX_UPLOAD_BYTES` | `500000` | Upload limit (Kafka's default message limit is about 1 MB) |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | API base URL baked into the frontend at build time |
+| `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated browser origins allowed to call the API |
 
 ## Limitations
 

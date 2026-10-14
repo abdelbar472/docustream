@@ -44,19 +44,27 @@ async def ensure_collection(client: AsyncQdrantClient, dim: int, attempts: int =
             await asyncio.sleep(delay)
 
 
+def make_point(*, doc_id: str, chunk_index: int, filename: str, text: str,
+               vector: list[float]) -> PointStruct:
+    return PointStruct(
+        id=point_id(doc_id, chunk_index),
+        vector=vector,
+        payload={"doc_id": doc_id, "chunk_index": chunk_index,
+                 "filename": filename, "text": text},
+    )
+
+
+async def upsert_points(client: AsyncQdrantClient, points: list[PointStruct]):
+    if not points:
+        return
+    await client.upsert(config.COLLECTION, points=points)
+
+
 async def upsert_chunk(client: AsyncQdrantClient, *, doc_id: str, chunk_index: int,
                        filename: str, text: str, vector: list[float]):
-    await client.upsert(
-        config.COLLECTION,
-        points=[
-            PointStruct(
-                id=point_id(doc_id, chunk_index),
-                vector=vector,
-                payload={"doc_id": doc_id, "chunk_index": chunk_index,
-                         "filename": filename, "text": text},
-            )
-        ],
-    )
+    await upsert_points(client, [make_point(
+        doc_id=doc_id, chunk_index=chunk_index, filename=filename, text=text, vector=vector,
+    )])
 
 
 async def search(client: AsyncQdrantClient, vector: list[float], limit: int = 5) -> list[dict]:

@@ -4,3 +4,7 @@ __pycache__
 data
 tests
 *.md
+
+# frontend build artifacts (rebuilt inside the image)
+frontend/node_modules
+frontend/.next

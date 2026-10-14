@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from . import config, db, vectorstore
@@ -27,6 +28,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Real-time document ingestion (RAG)", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class TextDocument(BaseModel):
@@ -94,6 +103,21 @@ async def get_document(doc_id: str):
 @app.get("/stats")
 async def stats():
     return await asyncio.to_thread(db.stats)
+
+
+@app.get("/stats/overview")
+async def stats_overview():
+    """Everything the dashboard needs in one call: document counts, chunk totals and
+    the vector count straight from Qdrant."""
+    data = await asyncio.to_thread(db.overview)
+    data["embedder"] = config.EMBEDDER
+    data["embedder_dim"] = app.state.embedder.dim
+    data["collection"] = config.COLLECTION
+    try:
+        data["vectors"] = (await app.state.qdrant.count(config.COLLECTION)).count
+    except Exception:
+        data["vectors"] = None
+    return data
 
 
 @app.get("/search")

@@ -67,6 +67,7 @@ services:
       QDRANT_URL: http://qdrant:6333
       SQLITE_PATH: /data/rag.db
       EMBEDDER: ${EMBEDDER:-hash}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
     volumes:
       - ./data:/data
     depends_on:
@@ -97,6 +98,20 @@ services:
       kafka-init:
         condition: service_completed_successfully
       qdrant:
+        condition: service_started
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+    depends_on:
+      api:
         condition: service_started
 
 volumes:
